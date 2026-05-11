@@ -407,8 +407,14 @@ class RealForensicAgent:
             return
 
         # Build evidence summary for LLM
+        def _safe_conf(val) -> float:
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return {"high": 0.8, "medium": 0.5, "low": 0.3}.get(str(val).lower(), 0.5)
+
         evidence_text = "\n".join(
-            f"- [{ev.type}] {ev.value} (confidence={ev.confidence:.0%})"
+            f"- [{ev.type}] {ev.value} (confidence={_safe_conf(ev.confidence):.0%})"
             for ev in session_obj.evidence[-20:]
         ) or "No evidence collected."
 
