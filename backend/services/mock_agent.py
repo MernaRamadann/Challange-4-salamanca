@@ -5,11 +5,16 @@ Generates realistic forensic investigation steps with proper tool chain reasonin
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import uuid
 import random
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
 if TYPE_CHECKING:
     from .session_manager import SessionManager
@@ -268,12 +273,22 @@ class MockForensicAgent:
         session_manager: "SessionManager",
         ws_manager: "WebSocketManager",
     ):
+        load_dotenv(override=True)
         self.session_id = session_id
         self.session_manager = session_manager
         self.ws_manager = ws_manager
         self._paused = False
         self._stopped = False
         self._step_counter = 0
+
+        # Explicitly configure OpenAI client for DeepInfra
+        api_key = os.getenv("DEEPINFRA_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+        base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepinfra.com/v1/openai")
+        self.openai_client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+        )
+        logger.info(f"OpenAI client configured: base_url={base_url}, key_set={bool(api_key)}")
 
     @classmethod
     def get_available_tools(cls) -> List[Dict[str, Any]]:
@@ -305,7 +320,7 @@ class MockForensicAgent:
         logger.info(f"Session {self.session_id} stopped")
 
     async def run_investigation(self) -> None:
-        """Run the complete forensic investigation pipeline."""
+        """Run the complete autonomous forensic investigation pipeline."""
         session = self.session_manager.get_session(self.session_id)
         if not session:
             return
@@ -314,31 +329,162 @@ class MockForensicAgent:
         self.session_manager.update_session(self.session_id, status="running")
 
         try:
-            # Phase 1: Initial Analysis
-            await self._run_phase("analysis", artifact_type)
+            max_steps = int(os.getenv("MAX_INVESTIGATION_STEPS", "18"))
+            while not self._stopped and self._step_counter < max_steps:
+                while self._paused:
+                    await asyncio.sleep(0.5)
 
-            # Phase 2: Deep Analysis
-            await self._run_phase("deep_analysis", artifact_type)
+                tool_config = await self._select_next_tool(artifact_type)
+                if not tool_config:
+                    logger.info(f"Session {self.session_id}: No further tools selected. Ending investigation loop.")
+                    break
 
-            # Phase 3: Threat Intelligence Enrichment
-            await self._run_phase("enrichment", artifact_type)
+                await self._execute_tool(tool_config, "analysis")
+                await asyncio.sleep(random.uniform(1.5, 3.0))
 
-            # Phase 4: Detection & MITRE Mapping
-            await self._run_phase("detection", artifact_type)
+                if await self._should_complete_analysis():
+                    logger.info(f"Session {self.session_id}: Stop condition reached after {self._step_counter} steps.")
+                    break
 
-            # Phase 5: Correlation & Timeline
-            await self._run_phase("correlation", artifact_type)
-
-            # Phase 6: Hypothesis Generation
-            await self._run_phase("hypothesis", artifact_type)
-
-            # Complete investigation
             await self._complete_investigation()
 
         except Exception as e:
             logger.exception(f"Investigation error: {e}")
             self.session_manager.update_session(self.session_id, status="failed")
             await self.ws_manager.send_error(self.session_id, str(e))
+
+    async def _select_next_tool(self, artifact_type: str) -> Optional[Dict[str, str]]:
+        """Choose the next forensic tool to run based on current evidence and history."""
+        session_obj = self.session_manager.get_session_object(self.session_id)
+        if not session_obj:
+            return None
+
+        used_tools = set()
+        for step in session_obj.steps:
+            for category, tools in self.TOOLS.items():
+                for tool_id, info in tools.items():
+                    if info["name"] == step.tool:
+                        used_tools.add((category, tool_id))
+
+        candidates = self._get_candidate_tools(artifact_type)
+        available = [tool for tool in candidates if (tool["category"], tool["tool"]) not in used_tools]
+        if not available:
+            return None
+
+        if os.getenv("REAL_FORENSIC_PLANNER", "true").lower() in ("1", "true", "yes", "y"):
+            planned = await self._plan_next_tool(artifact_type, session_obj, available)
+            if planned:
+                return planned
+
+        return available[0]
+
+    def _get_candidate_tools(self, artifact_type: str) -> List[Dict[str, str]]:
+        """Get a prioritized list of candidate tools for the artifact type."""
+        if artifact_type == "memory_dump":
+            return [
+                {"category": "memory_forensics", "tool": "volatility_pslist"},
+                {"category": "memory_forensics", "tool": "volatility_pstree"},
+                {"category": "memory_forensics", "tool": "volatility_netscan"},
+                {"category": "memory_forensics", "tool": "volatility_cmdline"},
+                {"category": "memory_forensics", "tool": "volatility_malfind"},
+                {"category": "memory_forensics", "tool": "volatility_dlllist"},
+                {"category": "memory_forensics", "tool": "volatility_handles"},
+                {"category": "memory_forensics", "tool": "volatility_registry"},
+            ]
+        if artifact_type == "disk_image":
+            return [
+                {"category": "disk_forensics", "tool": "plaso_log2timeline"},
+                {"category": "windows_forensics", "tool": "hayabusa"},
+                {"category": "malware_analysis", "tool": "strings"},
+                {"category": "disk_forensics", "tool": "sleuthkit_fls"},
+                {"category": "disk_forensics", "tool": "sleuthkit_icat"},
+            ]
+        if artifact_type == "evtx":
+            return [
+                {"category": "windows_forensics", "tool": "chainsaw"},
+                {"category": "windows_forensics", "tool": "hayabusa"},
+                {"category": "windows_forensics", "tool": "evtxecmd"},
+                {"category": "windows_forensics", "tool": "pecmd"},
+                {"category": "windows_forensics", "tool": "recmd"},
+            ]
+        if artifact_type == "malware_sample":
+            return [
+                {"category": "malware_analysis", "tool": "pe_analysis"},
+                {"category": "malware_analysis", "tool": "strings"},
+                {"category": "malware_analysis", "tool": "yara"},
+                {"category": "malware_analysis", "tool": "floss"},
+                {"category": "binary_analysis", "tool": "disassemble"},
+                {"category": "malware_analysis", "tool": "yara_ai"},
+            ]
+        if artifact_type == "pcap":
+            return [
+                {"category": "network_forensics", "tool": "pcap_analysis"},
+            ]
+        return [
+            {"category": "malware_analysis", "tool": "strings"},
+            {"category": "malware_analysis", "tool": "yara"},
+        ]
+
+    async def _plan_next_tool(
+        self,
+        artifact_type: str,
+        session_obj: "Session",
+        available_tools: List[Dict[str, str]],
+    ) -> Optional[Dict[str, str]]:
+        """Ask the LLM to select the next tool and explain why."""
+        try:
+            evidence_summary = "\n".join(
+                [f"- {ev.type}: {ev.value}" for ev in session_obj.evidence[-10:]]
+            ) or "No evidence collected yet."
+            step_summary = "\n".join(
+                [f"- {step.tool} ({step.phase}): {step.thought[:120]}" for step in session_obj.steps[-5:]]
+            ) or "No prior steps taken yet."
+            tool_lines = "\n".join(
+                [
+                    f"{idx + 1}. {tool['category']} / {tool['tool']}: {self.TOOLS[tool['category']][tool['tool']]['name']} - {self.TOOLS[tool['category']][tool['tool']]['description']}"
+                    for idx, tool in enumerate(available_tools)
+                ]
+            )
+            prompt = (
+                f"You are an autonomous forensic agent. The artifact type is {artifact_type}. "
+                "You have the following tool candidates available. Select the single best next tool to run based on the current evidence and previous steps. "
+                "Return only JSON with keys: tool_id, category, reason."
+                f"\n\nEvidence:\n{evidence_summary}\n\n"
+                f"Previous steps:\n{step_summary}\n\n"
+                f"Available tools:\n{tool_lines}\n\n"
+                "Choose the next tool that will provide the most useful information for progressing the investigation. "
+            )
+            response = await self._call_openai(prompt)
+            if not response:
+                return None
+            text = response.strip()
+            json_text = text[text.find("{"): text.rfind("}") + 1] if "{" in text and "}" in text else text
+            parsed = json.loads(json_text)
+            selected_tool = parsed.get("tool_id")
+            selected_category = parsed.get("category")
+            if selected_tool and selected_category:
+                if any(t["category"] == selected_category and t["tool"] == selected_tool for t in available_tools):
+                    return {"category": selected_category, "tool": selected_tool}
+        except Exception:
+            logger.exception("Tool planning failed")
+        return None
+
+    async def _should_complete_analysis(self) -> bool:
+        """Decide whether the agent should stop running more tools."""
+        session_obj = self.session_manager.get_session_object(self.session_id)
+        if not session_obj:
+            return True
+
+        if self._step_counter >= int(os.getenv("MAX_INVESTIGATION_STEPS", "18")):
+            return True
+        if len(session_obj.evidence) >= int(os.getenv("MAX_EVIDENCE_ITEMS", "12")):
+            return True
+
+        remaining_tools = [
+            tool for tool in self._get_candidate_tools(session_obj.artifact_type)
+            if tool["tool"] not in {step.tool for step in session_obj.steps}
+        ]
+        return len(remaining_tools) == 0
 
     async def _run_phase(self, phase: str, artifact_type: str) -> None:
         """Run a specific phase of the investigation."""
@@ -489,7 +635,7 @@ class MockForensicAgent:
 
         # Generate realistic tool execution
         start_time = datetime.utcnow()
-        tool_output = self._generate_tool_output(category, tool_id, previous_evidence)
+        tool_output = await self._generate_tool_output(category, tool_id, previous_evidence)
         duration_ms = random.randint(500, 3000)
 
         # Create the step
@@ -549,13 +695,18 @@ class MockForensicAgent:
 
         return step
 
-    def _generate_tool_output(
+    async def _generate_tool_output(
         self,
         category: str,
         tool_id: str,
         previous_evidence: List[Dict],
     ) -> Dict[str, Any]:
         """Generate realistic tool output based on tool type."""
+        if os.getenv("REAL_FORENSIC_ANALYSIS", "true").lower() in ("1", "true", "yes", "y"):
+            tool_output = await self._generate_tool_output_llm(category, tool_id, previous_evidence)
+            if tool_output:
+                return tool_output
+
         generators = {
             "memory_forensics": self._generate_memory_output,
             "disk_forensics": self._generate_disk_output,
@@ -572,6 +723,79 @@ class MockForensicAgent:
 
         generator = generators.get(category, self._generate_generic_output)
         return generator(tool_id, previous_evidence)
+
+    async def _generate_tool_output_llm(
+        self,
+        category: str,
+        tool_id: str,
+        previous_evidence: List[Dict],
+    ) -> Dict[str, Any]:
+        """Generate tool output using a real OpenAI-compatible model."""
+        try:
+            session = self.session_manager.get_session(self.session_id)
+            artifact_type = session.get("artifact_type", "unknown") if session else "unknown"
+            tool_info = self.TOOLS[category][tool_id]
+            evidence_summary = "\n".join(
+                [f"- {ev.get('type', 'unknown')}: {ev.get('value', 'N/A')}" for ev in previous_evidence[-8:]]
+            ) or "No prior evidence available."
+            prompt = (
+                f"You are a digital forensics analyst. Artifact type: {artifact_type}. "
+                f"Tool: {tool_info.get('name')} ({tool_info.get('description')}).\n"
+                f"Use the current investigation context to produce a concise, technical tool analysis output. "
+                f"Include what the tool would discover, the likely findings, and the next step reasoning. "
+                f"Here is the prior evidence:\n{evidence_summary}\n\n"
+                "Return a short, coherent analysis text suitable for investigation logs."
+            )
+            content = await self._call_openai(prompt)
+            if not content:
+                return {}
+
+            return {
+                "thought": f"Analyze artifact with {tool_info.get('name')}.",
+                "action": f"Perform {tool_info.get('name')} analysis on artifact type {artifact_type}.",
+                "input": {
+                    "tool": tool_info.get('name'),
+                    "artifact_type": artifact_type,
+                    "previous_evidence": [ev.get('type', '') + ': ' + str(ev.get('value', '')) for ev in previous_evidence[-8:]],
+                },
+                "output": {
+                    "raw": content,
+                },
+                "evidence": [],
+                "mitre_techniques": [],
+                "timeline_events": [],
+                "next_step_reasoning": "Continue the investigation using the next forensic phase based on the model output.",
+            }
+        except Exception as exc:
+            logger.exception("OpenAI tool output generation failed")
+            return {}
+
+    async def _call_openai(self, prompt: str) -> str:
+        """Call the configured OpenAI-compatible model and return the raw text."""
+        try:
+            model = os.getenv("CAI_MODEL", "deepseek-ai/DeepSeek-V3-0324")
+            logger.info(f"Calling LLM: model={model}, base_url={self.openai_client.base_url}")
+            response = await self.openai_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a smart DFIR analyst and investigator. "
+                            "Answer with a concise, technical, and factual analysis."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=550,
+            )
+            content = response.choices[0].message.content or ""
+            logger.info(f"LLM response received: {len(content)} chars")
+            return content
+        except Exception as exc:
+            logger.error(f"LLM call failed ({type(exc).__name__}): {str(exc)[:300]}")
+            return ""
 
     def _generate_memory_output(self, tool_id: str, prev_evidence: List) -> Dict[str, Any]:
         """Generate memory forensics tool output."""
@@ -1505,52 +1729,11 @@ class MockForensicAgent:
 
     async def _complete_investigation(self) -> None:
         """Complete the investigation and generate summary."""
-        session = self.session_manager.get_session(self.session_id)
-        if not session:
+        session_obj = self.session_manager.get_session_object(self.session_id)
+        if not session_obj:
             return
 
-        evidence_count = len(session.get("evidence", []))
-        steps_count = len(session.get("steps", []))
-        techniques = set()
-        for step in session.get("steps", []):
-            for ev in step.get("evidence", []):
-                techniques.update(ev.get("mitre_techniques", []))
-
-        summary = f"""
-## Investigation Summary
-
-**Artifact Analyzed:** {session.get('artifact_name')} ({session.get('artifact_type')})
-
-**Analysis Duration:** {steps_count} steps completed
-
-**Key Findings:**
-- {evidence_count} pieces of evidence discovered
-- {len(techniques)} MITRE ATT&CK techniques identified
-- Multi-stage attack confirmed: Emotet → PowerShell → Cobalt Strike → Mimikatz
-
-**Threat Assessment:** CRITICAL
-- Active C2 communication detected
-- Credential theft confirmed
-- Persistence mechanisms installed
-
-**Recommended Actions:**
-1. Immediately isolate affected systems
-2. Block identified C2 infrastructure
-3. Reset all potentially compromised credentials
-4. Deploy EDR signatures for identified malware
-5. Conduct enterprise-wide threat hunt
-"""
-
-        conclusion = """
-The forensic analysis conclusively identified a sophisticated multi-stage intrusion.
-The attack began with an Emotet phishing campaign, which downloaded and executed a
-Cobalt Strike beacon via encoded PowerShell. The threat actor established multiple
-persistence mechanisms and accessed LSASS memory for credential harvesting using
-Mimikatz. Two C2 channels were identified, one using standard HTTPS (port 443) and
-another using non-standard port 8443. The infrastructure is associated with
-financially motivated threat actors, suggesting either data theft or ransomware
-deployment as the ultimate objective.
-"""
+        summary, conclusion, hypotheses = await self._generate_final_summary(session_obj)
 
         self.session_manager.complete_session(
             self.session_id,
@@ -1562,22 +1745,48 @@ deployment as the ultimate objective.
         await self.ws_manager.send_progress(self.session_id, 100, "completed")
         await self.ws_manager.send_complete(self.session_id, summary.strip(), conclusion.strip())
 
-        # Add final hypotheses to session
-        hypotheses = [
-            {
-                "confidence": 0.92,
-                "title": "Multi-stage Intrusion: Emotet + Cobalt Strike",
-                "threat_actor": "TA551 / Shathak",
-                "objective": "Credential harvesting and persistent backdoor access",
-            },
-            {
-                "confidence": 0.75,
-                "title": "Potential Ransomware Precursor Activity",
-                "threat_actor": "Unknown",
-                "objective": "Prepare network for ransomware deployment",
-            },
-        ]
-
         for hyp in hypotheses:
             self.session_manager.add_hypothesis(self.session_id, hyp)
             await self.ws_manager.send_hypothesis(self.session_id, hyp)
+
+    async def _generate_final_summary(self, session_obj: "Session") -> tuple[str, str, List[Dict[str, Any]]]:
+        """Generate final summary, conclusion and hypotheses for the session."""
+        try:
+            evidence_summary = "\n".join(
+                [f"- {ev.type}: {ev.value} ({ev.threat_score * 100:.0f}% confidence)" for ev in session_obj.evidence[-15:]]
+            ) or "No evidence was collected during this investigation."
+            step_summary = "\n".join(
+                [f"- {step.tool} ({step.phase}): {step.thought[:120]}" for step in session_obj.steps[-10:]]
+            ) or "No steps were executed during this investigation."
+            prompt = (
+                "You are a senior digital forensics investigator tasked with producing a concise incident summary. "
+                "Based on the evidence and the sequence of tool steps, provide a JSON object with keys: summary, conclusion, hypotheses. "
+                "Hypotheses should be a list of up to 2 objects with title, confidence, threat_actor, and objective. "
+                f"Evidence:\n{evidence_summary}\n\n"
+                f"Steps:\n{step_summary}\n\n"
+                "Write clearly for security analysts and incident responders."
+            )
+            response = await self._call_openai(prompt)
+            if response:
+                text = response.strip()
+                json_text = text[text.find("{"): text.rfind("}") + 1] if "{" in text and "}" in text else text
+                data = json.loads(json_text)
+                summary = data.get("summary", text)
+                conclusion = data.get("conclusion", text)
+                hypotheses = data.get("hypotheses", [])
+                if isinstance(hypotheses, list):
+                    return summary, conclusion, hypotheses
+        except Exception:
+            logger.exception("Final summary generation failed")
+
+        fallback_summary = f"Investigation completed for {session_obj.artifact_name}. {len(session_obj.steps)} steps executed and {len(session_obj.evidence)} pieces of evidence collected."
+        fallback_conclusion = "Autonomous forensic analysis completed. Review the collected evidence for final incident response actions."
+        fallback_hypotheses = [
+            {
+                "confidence": 0.65,
+                "title": "Suspicious multi-stage intrusion detected",
+                "threat_actor": "Unknown",
+                "objective": "Establish persistence and data exfiltration.",
+            }
+        ]
+        return fallback_summary, fallback_conclusion, fallback_hypotheses

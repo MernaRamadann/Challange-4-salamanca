@@ -12,8 +12,13 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-# Add parent directory to path for imports
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+
+# Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+load_dotenv(override=True)
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,12 +30,12 @@ from pydantic import BaseModel
 try:
     from backend.services.session_manager import SessionManager, session_manager
     from backend.services.websocket_manager import WebSocketManager, ws_manager
-    from backend.services.mock_agent import MockForensicAgent
+    from backend.services.real_agent import RealForensicAgent
     from backend.services.report_generator import ReportGenerator
 except ImportError:
     from services.session_manager import SessionManager, session_manager
     from services.websocket_manager import WebSocketManager, ws_manager
-    from services.mock_agent import MockForensicAgent
+    from services.real_agent import RealForensicAgent
     from services.report_generator import ReportGenerator
 
 # Configure logging
@@ -322,8 +327,8 @@ async def delete_session(session_id: str):
 async def list_tools():
     """List all available forensic tools."""
     return {
-        "tools": MockForensicAgent.get_available_tools(),
-        "total": len(MockForensicAgent.get_available_tools()),
+        "tools": RealForensicAgent.get_available_tools(),
+        "total": len(RealForensicAgent.get_available_tools()),
     }
 
 
@@ -334,8 +339,8 @@ async def list_tools():
 async def process_llm_query(query: str, context: dict, session: dict) -> str:
     """
     Process natural language queries about the investigation.
-    In production, this would call an actual LLM API (OpenAI, Anthropic, etc.)
-    For demo, we simulate intelligent responses based on investigation data.
+    In production, this calls the configured OpenAI-compatible API (DeepInfra, OpenAI, etc.)
+    when available. Otherwise it falls back to the local simulated response.
     """
     query_lower = query.lower()
 
@@ -344,6 +349,13 @@ async def process_llm_query(query: str, context: dict, session: dict) -> str:
     steps_list = context.get("steps", []) or session.get("steps", [])
     mitre_data = context.get("mitre", {}) or session.get("mitre_coverage", {})
     hypotheses_list = context.get("hypotheses", []) or session.get("hypotheses", [])
+
+    if os.getenv("REAL_FORENSIC_LLM", "true").lower() in ("1", "true", "yes", "y"):
+        try:
+            return await _call_real_llm_query(query, evidence_list, steps_list, mitre_data, hypotheses_list)
+        except Exception as e:
+            logger.exception("Real LLM query failed, falling back to local response")
+
 
     # Analyze evidence by type
     evidence_by_type = {}
@@ -505,6 +517,65 @@ async def process_llm_query(query: str, context: dict, session: dict) -> str:
         return response
 
 
+async def _call_real_llm_query(
+    query: str,
+    evidence_list: list,
+    steps_list: list,
+    mitre_data: dict,
+    hypotheses_list: list,
+) -> str:
+    """Call the configured OpenAI-compatible model for investigation responses."""
+    api_key = os.getenv("DEEPINFRA_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepinfra.com/v1/openai")
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    model = os.getenv("CAI_MODEL", "deepseek-ai/DeepSeek-V3-0324")
+
+    evidence_summary = "\n".join(
+        [f"- {ev.get('type', 'unknown')}: {ev.get('value', 'N/A')}" for ev in (evidence_list or [])[:10]]
+    ) or "No evidence has been collected yet."
+    steps_summary = "\n".join(
+        [f"- {step.get('tool', 'step')} ({step.get('phase', 'unknown')}): {step.get('thought', '')[:120]}" for step in (steps_list or [])[:5]]
+    ) or "No investigation steps have run yet."
+    mitre_summary = "\n".join(
+        [f"- {tactic}: {', '.join(values) if isinstance(values, list) else values}" for tactic, values in (mitre_data or {}).items()][:10]
+    ) or "No MITRE techniques identified yet."
+    hypotheses_summary = "\n".join(
+        [f"- {hyp.get('title', 'unknown')} ({hyp.get('confidence', 0.0) * 100:.0f}%): {hyp.get('objective', '')}" for hyp in (hypotheses_list or [])[:5]]
+    ) or "No attack hypotheses generated yet."
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a highly skilled DFIR analyst and investigation assistant. "
+                "Use the context from the current investigation to answer the user query accurately and technically. "
+                "Focus on evidence, suspicious behavior, and any MITRE ATT&CK mappings provided. "
+                "If evidence is missing, be transparent about what cannot be inferred."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"User query: {query}\n\n"
+                f"Evidence summary:\n{evidence_summary}\n\n"
+                f"Investigation steps summary:\n{steps_summary}\n\n"
+                f"MITRE summary:\n{mitre_summary}\n\n"
+                f"Hypotheses summary:\n{hypotheses_summary}\n\n"
+                "Answer with a concise but technical response that directly addresses the query."
+            ),
+        },
+    ]
+
+    response = await client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=700,
+    )
+
+    return response.choices[0].message.content or ""
+
+
 # ============================================================================
 # WebSocket Endpoint
 # ============================================================================
@@ -521,17 +592,22 @@ async def websocket_agent(websocket: WebSocket, session_id: str):
     - complete: Investigation complete
     - error: Error occurred
     """
+    # Must accept first, otherwise FastAPI returns 403 Forbidden
+    await websocket.accept()
+
     session = session_manager.get_session(session_id)
     if not session:
+        await websocket.send_json({"type": "error", "message": f"Session {session_id} not found. Please upload a new artifact."})
         await websocket.close(code=4004, reason="Session not found")
         return
 
-    await ws_manager.connect(websocket, session_id)
+    async with ws_manager._lock:
+        ws_manager._connections[session_id].add(websocket)
     logger.info(f"WebSocket connected for session {session_id}")
 
     try:
         # Start the forensic agent
-        agent = MockForensicAgent(session_id, session_manager, ws_manager)
+        agent = RealForensicAgent(session_id, session_manager, ws_manager)
 
         # Run analysis in background
         import asyncio
