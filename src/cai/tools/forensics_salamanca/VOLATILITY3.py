@@ -1,7 +1,12 @@
 import subprocess
 import sys
 import os
+import csv
+import io
+import re
+from datetime import datetime
 from contextlib import contextmanager
+
 
 VOLATILITY_EXE = r"C:\Users\Me\volatility3\vol.py"
 
@@ -14,6 +19,91 @@ WINDOWS_PLUGINS = [
 LINUX_PLUGINS = [
     "linux.pslist", "linux.bash", "linux.lsmod", "linux.lsof", "linux.netstat"
 ]
+
+def build_timeline(plugin_name: str, csv_output: str):
+
+    timeline = []
+
+    try:
+
+        reader = csv.DictReader(io.StringIO(csv_output))
+
+        for row in reader:
+
+            timestamp = None
+
+            possible_time_fields = [
+                "CreateTime",
+                "Created",
+                "Timestamp",
+                "Time"
+            ]
+
+            for field in possible_time_fields:
+
+                if field in row and row[field]:
+
+                    try:
+                        timestamp = row[field]
+                        break
+                    except Exception:
+                        pass
+
+            description = ""
+
+            if plugin_name == "windows.pslist":
+
+                process_name = row.get("ImageFileName", "unknown")
+                pid = row.get("PID", "?")
+
+                description = f"Process started: {process_name} (PID {pid})"
+
+            elif plugin_name == "windows.cmdline":
+
+                process_name = row.get("Process", "unknown")
+
+                description = f"Command execution observed: {process_name}"
+
+            else:
+
+                description = f"{plugin_name} activity detected"
+
+            if timestamp:
+
+                timeline.append({
+                    "timestamp": timestamp,
+                    "plugin": plugin_name,
+                    "description": description
+                })
+
+    except Exception as e:
+        print(f"[WARNING] Timeline build failed: {e}")
+
+    return timeline
+
+def extract_flags(text: str):
+    """Extract MemLab flags."""
+
+    patterns = [
+        r"flag\\{.*?\\}",
+        r"FLAG\\{.*?\\}",
+        r"pctf\\{.*?\\}",
+        r"memlab\\{.*?\\}"
+    ]
+
+    flags = []
+
+    for pattern in patterns:
+
+        matches = re.findall(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+        flags.extend(matches)
+
+    return list(set(flags))
 
 def detect_os(memory_path: str) -> str:
     try:
@@ -56,13 +146,44 @@ def run_volatility_plugin(memory_path: str, plugin_name: str):
         return f"[SKIPPED] {plugin_name} not supported or failed."
 
 def run_volatility(memory_path: str, os_type: str):
+
     results = {}
-    plugins = WINDOWS_PLUGINS if os_type.lower() == "windows" else LINUX_PLUGINS if os_type.lower() == "linux" else []
+    master_timeline = []
+
+    plugins = (
+        WINDOWS_PLUGINS
+        if os_type.lower() == "windows"
+        else LINUX_PLUGINS
+        if os_type.lower() == "linux"
+        else []
+    )
+
     if not plugins:
         print("[ERROR] Unknown OS type, skipping scan.")
         return results
+
     for plugin in plugins:
-        results[plugin] = run_volatility_plugin(memory_path, plugin)
+
+        output = run_volatility_plugin(memory_path, plugin)
+
+        results[plugin] = output
+        flags = extract_flags(output)
+
+        if flags:
+
+            if "flags" not in results:
+                results["flags"] = []
+
+            results["flags"].extend(flags)
+
+        timeline_events = build_timeline(plugin, output)
+
+        master_timeline.extend(timeline_events)
+
+    master_timeline.sort(key=lambda x: x["timestamp"])
+
+    results["timeline"] = master_timeline
+
     return results
 
 @contextmanager

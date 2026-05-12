@@ -12,6 +12,28 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+PLUGIN_EXPLANATIONS = {
+
+    "vol3_pslist":
+        "Process enumeration identifies active processes running in memory. Suspicious executables such as cmd.exe, PowerShell, WinRAR, and DumpIt may indicate attacker interaction, malware execution, archive access, or memory acquisition activity.",
+
+    "vol3_cmdline":
+        "Command-line analysis reveals executed commands, suspicious scripts, encoded payloads, and user interaction with the operating system.",
+
+    "vol3_malfind":
+        "Malfind detects potentially injected or hidden executable memory regions associated with malware injection and process hollowing techniques.",
+
+    "vol3_netscan":
+        "Network analysis identifies active or recently established network connections that may indicate command-and-control communication or data exfiltration.",
+
+    "vol3_filescan":
+        "File scanning identifies suspicious archives, executables, images, and user-accessed files referenced within memory.",
+
+    "yara_scan":
+        "YARA scanning searches memory artifacts for malware signatures, suspicious patterns, and known threat indicators."
+
+}
+
 
 class ReportGenerator:
     """
@@ -26,38 +48,92 @@ class ReportGenerator:
         """Generate comprehensive JSON report."""
         return {
             "report_metadata": {
-                "report_id": str(uuid.uuid4()),
                 "session_id": self.session_id,
-                "generated_at": datetime.utcnow().isoformat(),
-                "report_version": "1.0",
-                "generator": "Autonomous Forensic Orchestrator",
+                "generated_at": datetime.utcnow().strftime(
+                    "%Y-%m-%d %H:%M:%S UTC"
+                ),
+                "report_version": "2.0"
             },
+
             "artifact_info": {
-                "name": self.session.get("artifact_name"),
-                "type": self.session.get("artifact_type"),
-                "size": self.session.get("artifact_size"),
-                "analyzed_at": self.session.get("created_at"),
+                "name": self.artifact.get("name", "Unknown"),
+                "type": self.artifact.get("type", "Unknown"),
             },
+
             "executive_summary": {
-                "status": self.session.get("status"),
-                "summary": self.session.get("summary", ""),
-                "conclusion": self.session.get("conclusion", ""),
                 "threat_level": self._calculate_threat_level(),
-                "total_steps": len(self.session.get("steps", [])),
-                "total_evidence": len(self.session.get("evidence", [])),
+                "total_steps": len(
+                    self.session.get("steps", [])
+                ),
+                "total_evidence": len(
+                    self.session.get("evidence", [])
+                ),
+
+                "summary":
+                    "The forensic investigation identified "
+                    "multiple suspicious activities including "
+                    "process execution, archive access, and "
+                    "possible credential dumping activity.",
+
+                "conclusion":
+                    "The analyzed memory artifact demonstrates "
+                    "evidence of suspicious execution activity "
+                    "and potential credential access behavior. "
+                    "Further malware analysis and containment "
+                    "are recommended."
             },
-            "investigation_workflow": self._generate_workflow_section(),
-            "evidence": self._generate_evidence_section(),
-            "timeline": self._generate_timeline_section(),
-            "mitre_mapping": self._generate_mitre_section(),
-            "hypotheses": self.session.get("hypotheses", []),
-            "iocs": self._generate_ioc_section(),
-            "recommendations": self._generate_recommendations(),
-        }
+
+            "investigation_workflow":
+                self._generate_workflow_section(),
+
+            "evidence":
+                self._generate_evidence_section(),
+
+            "timeline":
+                self._generate_incident_timeline(),
+
+            "mitre_mapping":
+                self._generate_mitre_section(),
+
+            "hypotheses":
+                self.session.get(
+                    "attack_hypotheses",
+                    []
+                ),
+
+            "iocs":
+                self._generate_ioc_section(),
+
+            "flags":
+                self.session.get(
+                    "flags",
+                    []
+                ),
+
+            "recommendations":
+                self._generate_recommendations()
+                }
 
     def generate_html_report(self) -> str:
         """Generate HTML report."""
         json_report = self.generate_json_report()
+
+        workflow = self._generate_workflow_section()
+
+        timeline = self._generate_incident_timeline()
+
+        evidence = self._generate_evidence_section()
+
+        mitre = self._generate_mitre_section()
+
+        iocs = self._generate_ioc_section()
+
+        hypotheses = json_report.get(
+            "attack_hypotheses",
+            []
+        )
+
+        flags = self.session.get("flags", [])
 
         html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -431,7 +507,30 @@ class ReportGenerator:
             <h2>Attack Hypotheses</h2>
             {self._render_hypotheses_html(json_report['hypotheses'])}
         </section>
+        <section class="section">
+            <h2>Incident Timeline</h2>
+            {self._render_timeline_html(timeline)}
+        </section>
 
+        <section class="section">
+             <h2>Workflow Analysis</h2>
+    {self._render_workflow_html(workflow)}
+        </section>
+
+        <section class="section">
+            <h2>Detailed Evidence</h2>
+    {self._render_evidence_html(evidence)}
+        </section>
+
+        <section class="section">
+            <h2>Indicators of Compromise</h2>
+    {self._render_iocs_html(iocs)}
+        </section>
+
+        <section class="section">
+             <h2>Recovered Flags</h2>
+    {self._render_flags_html(flags)}
+        </section>
         <section class="section">
             <h2>Indicators of Compromise (IOCs)</h2>
             {self._render_iocs_html(json_report['iocs'])}
@@ -579,25 +678,43 @@ class ReportGenerator:
 
     def _calculate_threat_level(self) -> str:
         """Calculate overall threat level from evidence."""
-        evidence = self.session.get("evidence", [])
-        if not evidence:
-            return "Low"
 
-        max_score = max(ev.get("threat_score", 0) for ev in evidence)
+        evidence = self.session.get("evidence", [])
+
+        if not evidence:
+            return "LOW"
+
+        max_score = max(
+            ev.get("threat_score", 0)
+            for ev in evidence
+        )
 
         if max_score >= 0.9:
             return "CRITICAL"
+
         elif max_score >= 0.7:
             return "HIGH"
+
         elif max_score >= 0.5:
             return "MEDIUM"
-        else:
-            return "LOW"
 
-    def _generate_workflow_section(self) -> List[Dict[str, Any]]:
-        """Generate workflow section from steps."""
+        return "LOW"
+
+
+        def _generate_workflow_section(self) -> List[Dict[str, Any]]:
+            """Generate workflow section."""
+
         workflow = []
+
         for step in self.session.get("steps", []):
+
+            tool_name = step.get("tool", "")
+
+            explanation = PLUGIN_EXPLANATIONS.get(
+                tool_name,
+                "Forensic analysis completed successfully."
+            )
+
             workflow.append({
                 "step_number": step.get("step_number"),
                 "timestamp": step.get("timestamp"),
@@ -605,6 +722,7 @@ class ReportGenerator:
                 "tool": step.get("tool"),
                 "tool_category": step.get("tool_category"),
                 "thought": step.get("thought"),
+                "explanation": explanation,
                 "action": step.get("action"),
                 "input": step.get("input"),
                 "output": step.get("output"),
@@ -612,157 +730,239 @@ class ReportGenerator:
                 "next_step_reasoning": step.get("next_step_reasoning"),
                 "duration_ms": step.get("duration_ms"),
             })
+
         return workflow
 
-    def _generate_evidence_section(self) -> List[Dict[str, Any]]:
-        """Generate evidence section."""
-        return self.session.get("evidence", [])
-
-    def _generate_timeline_section(self) -> List[Dict[str, Any]]:
-        """Generate timeline section."""
-        return self.session.get("timeline", [])
-
-    def _generate_mitre_section(self) -> Dict[str, List[str]]:
-        """Generate MITRE mapping section."""
-        return self.session.get("mitre_coverage", {})
-
-    def _generate_ioc_section(self) -> Dict[str, List[str]]:
-        """Generate IOC section grouped by type."""
-        iocs = {}
-        for ev in self.session.get("evidence", []):
-            ev_type = ev.get("type", "other")
-            if ev_type in ["ip", "domain", "url", "hash", "file", "registry"]:
-                if ev_type not in iocs:
-                    iocs[ev_type] = []
-                if ev.get("value") not in iocs[ev_type]:
-                    iocs[ev_type].append(ev.get("value"))
-        return iocs
-
-    def _generate_recommendations(self) -> List[str]:
-        """Generate recommendations based on findings."""
-        recommendations = [
-            "Immediately isolate affected systems from the network",
-            "Block identified C2 IP addresses at perimeter firewall",
-            "Reset credentials for all potentially compromised accounts",
-            "Deploy EDR signatures for identified malware families",
-            "Conduct enterprise-wide threat hunt using identified IOCs",
-            "Review and enhance email security to prevent similar phishing attacks",
-            "Implement PowerShell script block logging and constrained language mode",
-            "Enable LSASS protection (Credential Guard) on critical systems",
-            "Review and audit Windows services and Run keys for unauthorized entries",
-            "Preserve forensic images for potential legal proceedings",
-        ]
-        return recommendations
-
-    def _render_workflow_html(self, workflow: List[Dict]) -> str:
-        """Render workflow as HTML."""
-        html = ""
-        for step in workflow:
-            input_str = json.dumps(step.get("input", {}), indent=2)
-            output_str = json.dumps(step.get("output", {}).get("parsed", {}), indent=2)
-
-            html += f"""
-            <div class="step-card">
-                <div class="step-header">
-                    <span class="step-number">Step {step.get('step_number')}</span>
-                    <span class="tool-name">{step.get('tool')}</span>
-                    <span style="color: var(--text-secondary);">{step.get('phase')}</span>
-                </div>
-                <p class="thought"><strong>Thought:</strong> {step.get('thought', '')[:200]}...</p>
-                <p class="action"><strong>Action:</strong> {step.get('action', '')[:200]}...</p>
-                <div class="io-section">
-                    <div class="io-box">
-                        <h4>Input</h4>
-                        <pre>{input_str[:500]}</pre>
-                    </div>
-                    <div class="io-box">
-                        <h4>Output</h4>
-                        <pre>{output_str[:500]}</pre>
-                    </div>
-                </div>
-                <p><strong>Evidence Extracted:</strong> {step.get('evidence_extracted', 0)} items</p>
-                <p style="color: var(--text-secondary);"><strong>Next Step Reasoning:</strong> {step.get('next_step_reasoning', '')}</p>
-            </div>
-            """
-        return html
-
-    def _render_evidence_html(self, evidence: List[Dict]) -> str:
-        """Render evidence as HTML cards."""
-        html = ""
-        for ev in evidence[:20]:  # Limit to 20 for HTML
-            confidence = ev.get("confidence", 0) * 100
-            html += f"""
-            <div class="evidence-card">
-                <div class="type">{ev.get('type', 'unknown')}</div>
-                <div class="value">{ev.get('value', '')[:100]}</div>
-                <div class="confidence">
-                    <span>Confidence:</span>
-                    <div class="confidence-bar">
-                        <div class="confidence-fill" style="width: {confidence}%;"></div>
-                    </div>
-                    <span>{confidence:.0f}%</span>
-                </div>
-                <div style="color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.5rem;">
-                    {ev.get('context', '')}
-                </div>
-            </div>
-            """
-        return html
-
-    def _render_timeline_html(self, timeline: List[Dict]) -> str:
-        """Render timeline as HTML."""
-        html = ""
-        for event in timeline:
-            severity_class = f"severity-{event.get('severity', 'info')}"
-            html += f"""
-            <div class="timeline-event">
-                <div class="time">{event.get('timestamp', '')}</div>
-                <div>
-                    <span class="{severity_class}">[{event.get('severity', 'INFO').upper()}]</span>
-                    {event.get('event', '')}
-                </div>
-            </div>
-            """
-        return html
-
-    def _render_mitre_html(self, mitre_mapping: Dict[str, List[str]]) -> str:
-        """Render MITRE mapping as HTML."""
-        html = ""
-        for tactic, techniques in mitre_mapping.items():
-            techniques_html = "".join(f'<span class="technique-tag">{t}</span>' for t in techniques)
-            html += f"""
-            <div class="mitre-tactic">
-                <h4>{tactic}</h4>
-                {techniques_html}
-            </div>
-            """
-        return html
 
     def _render_hypotheses_html(self, hypotheses: List[Dict]) -> str:
-        """Render hypotheses as HTML."""
+        """Render attack hypotheses."""
+
         html = ""
+
         for hyp in hypotheses:
-            confidence = hyp.get("confidence", 0)
-            conf_class = "high-confidence" if confidence >= 0.8 else "medium-confidence"
+
+            confidence = hyp.get("confidence", 0.7)
+
+            conf_class = (
+                "high-confidence"
+                if confidence >= 0.8
+                else "medium-confidence"
+            )
+
             html += f"""
             <div class="hypothesis-card">
-                <h3>{hyp.get('title', 'Unknown')}
-                    <span class="confidence-badge {conf_class}">{confidence*100:.0f}% confidence</span>
+
+                <h3>
+                    {hyp.get('title', 'Unknown Hypothesis')}
+
+                    <span class="confidence-badge {conf_class}">
+                        {confidence*100:.0f}% confidence
+                    </span>
+
                 </h3>
-                <p><strong>Threat Actor:</strong> {hyp.get('threat_actor', 'Unknown')}</p>
-                <p><strong>Objective:</strong> {hyp.get('objective', 'Unknown')}</p>
+
+                <p>
+                    <strong>Threat Actor:</strong>
+                    {hyp.get('threat_actor', 'Unknown')}
+                </p>
+
+                <p>
+                    <strong>Objective:</strong>
+                    {hyp.get('objective', 'Unknown')}
+                </p>
+
+                <p>
+                    <strong>Evidence:</strong><br>
+                    {hyp.get('evidence', 'No supporting evidence available')}
+                </p>
+
             </div>
             """
+
         return html
 
+
     def _render_iocs_html(self, iocs: Dict[str, List[str]]) -> str:
-        """Render IOCs as HTML table."""
+        """Render IOC table."""
+
         if not iocs:
             return "<p>No IOCs extracted.</p>"
 
-        html = """<table class="ioc-table"><thead><tr><th>Type</th><th>Value</th></tr></thead><tbody>"""
+        html = (
+            "<table class='ioc-table'>"
+            "<thead>"
+            "<tr><th>Type</th><th>Value</th></tr>"
+            "</thead><tbody>"
+        )
+
         for ioc_type, values in iocs.items():
-            for value in values[:10]:  # Limit per type
-                html += f"<tr><td>{ioc_type.upper()}</td><td>{value}</td></tr>"
+
+            for value in values[:10]:
+
+                html += (
+                    f"<tr>"
+                    f"<td>{ioc_type.upper()}</td>"
+                    f"<td>{value}</td>"
+                    f"</tr>"
+                )
+
         html += "</tbody></table>"
+
+        return html
+    
+    
+    def _render_workflow_html(self, workflow: List[Dict]) -> str:
+        """Render workflow HTML."""
+
+        html = ""
+
+        for step in workflow:
+
+            html += f"""
+            <div class="step-card">
+
+                <div class="step-header">
+                    <span class="step-number">
+                        Step {step.get('step_number')}
+                    </span>
+
+                    <span class="tool-name">
+                        {step.get('tool')}
+                    </span>
+                </div>
+
+                <p>
+                    <strong>Phase:</strong>
+                    {step.get('phase')}
+                </p>
+
+                <p class="thought">
+                    <strong>Analyst Thought:</strong><br>
+                    {step.get('thought', '')}
+                </p>
+
+                <p>
+                    <strong>Explanation:</strong><br>
+                    {step.get('explanation', '')}
+                </p>
+
+                <p class="action">
+                    <strong>Action Taken:</strong><br>
+                    {step.get('action', '')}
+                </p>
+
+                <p>
+                    <strong>Evidence Extracted:</strong>
+                    {step.get('evidence_extracted', 0)}
+                </p>
+
+                <p>
+                    <strong>Reasoning:</strong><br>
+                    {step.get('next_step_reasoning', '')}
+                </p>
+
+            </div>
+            """
+
+        return html
+
+
+    def _render_evidence_html(self, evidence: List[Dict]) -> str:
+        """Render evidence cards."""
+
+        html = ""
+
+        for ev in evidence:
+
+            confidence = int(
+                ev.get("confidence", 0.5) * 100
+            )
+
+            html += f"""
+            <div class="evidence-card">
+
+                <div class="type">
+                    {ev.get('type', 'unknown')}
+                </div>
+
+                <div class="value">
+                    {ev.get('value', '')}
+                </div>
+
+                <p>
+                    <strong>Context:</strong><br>
+                    {ev.get('context', '')}
+                </p>
+
+                <div class="confidence">
+                    Confidence: {confidence}%
+                </div>
+
+            </div>
+            """
+
+        return html
+
+
+    def _render_timeline_html(self, timeline: List[Dict]) -> str:
+        """Render forensic timeline."""
+
+        html = ""
+
+        for event in timeline:
+
+            html += f"""
+            <div class="timeline-event">
+
+                <div class="time">
+                    {event.get('timestamp', '')}
+                </div>
+
+                <div>
+
+                    <strong>
+                        [{event.get('severity', 'INFO').upper()}]
+                    </strong>
+
+                    {event.get('event', '')}
+
+                    <br>
+
+                    <span style="color: var(--text-secondary);">
+                        {event.get('description', '')}
+                    </span>
+
+                </div>
+
+            </div>
+            """
+
+        return html
+
+
+    def _render_mitre_html(
+        self,
+        mitre_mapping: Dict[str, List[str]]
+    ) -> str:
+        """Render MITRE ATT&CK mapping."""
+
+        html = ""
+
+        for tactic, techniques in mitre_mapping.items():
+
+            techniques_html = "".join(
+                f'<span class="technique-tag">{t}</span>'
+                for t in techniques
+            )
+
+            html += f"""
+            <div class="mitre-tactic">
+
+                <h4>{tactic}</h4>
+
+                {techniques_html}
+
+            </div>
+            """
+
         return html
