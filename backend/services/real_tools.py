@@ -274,6 +274,59 @@ async def tool_yara_scan(artifact_path: str) -> Dict[str, Any]:
 
 
 # ============================================================================
+# Tool: Sleuth Kit (disk / partition forensics)
+# ============================================================================
+
+async def tool_tsk_fls(artifact_path: str, inode: str = "", offset: int = 0) -> Dict[str, Any]:
+    """List files and directories using TSK fls."""
+    cmd = ["fls", "-r", "-p"]
+    if offset:
+        cmd += ["-o", str(offset)]
+    cmd.append(artifact_path)
+    if inode:
+        cmd.append(inode)
+    result = await run_cmd(cmd, timeout=300)
+    return {
+        "tool": "tsk_fls",
+        "description": "Sleuth Kit file listing (recursive)",
+        "output": result["stdout"][:15000],
+        "stderr": result["stderr"][:2000] if result["returncode"] != 0 else "",
+        "success": result["returncode"] == 0,
+    }
+
+
+async def tool_tsk_icat(artifact_path: str, inode: str, offset: int = 0) -> Dict[str, Any]:
+    """Extract a file by inode using TSK icat (returns first 8KB as hex)."""
+    cmd = ["icat"]
+    if offset:
+        cmd += ["-o", str(offset)]
+    cmd += [artifact_path, inode]
+    result = await run_cmd(cmd, timeout=120)
+    raw = result["stdout"]
+    # Show printable + hex summary (binary file)
+    printable = "".join(c if c.isprintable() or c in "\n\r\t" else "." for c in raw[:4000])
+    return {
+        "tool": "tsk_icat",
+        "description": f"Sleuth Kit file extraction (inode {inode})",
+        "output": printable,
+        "size_bytes": len(raw),
+        "success": result["returncode"] == 0,
+    }
+
+
+async def tool_tsk_mmls(artifact_path: str) -> Dict[str, Any]:
+    """List partitions using TSK mmls."""
+    result = await run_cmd(["mmls", artifact_path], timeout=60)
+    return {
+        "tool": "tsk_mmls",
+        "description": "Sleuth Kit partition listing",
+        "output": result["stdout"][:5000],
+        "stderr": result["stderr"][:2000] if result["returncode"] != 0 else "",
+        "success": result["returncode"] == 0,
+    }
+
+
+# ============================================================================
 # Master: get available tools
 # ============================================================================
 
@@ -284,6 +337,9 @@ def get_available_tools() -> List[Dict[str, str]]:
         ("file", "file", "File type identification"),
         ("strings", "strings", "Readable string extraction"),
         ("xxd", "xxd", "Hex dump analysis"),
+        ("tsk_fls", "fls", "Sleuth Kit – recursive file listing"),
+        ("tsk_mmls", "mmls", "Sleuth Kit – partition map"),
+        ("tsk_icat", "icat", "Sleuth Kit – file extraction by inode"),
     ]
     for tool_id, cmd, desc in checks:
         if _which(cmd):
