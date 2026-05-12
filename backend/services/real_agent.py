@@ -62,10 +62,10 @@ You have access to the following tools. Call them one at a time:
 │                       │ files, documents, RAR/ZIP archives, executables.       │
 │ vol3_consoles         │ Console input/output history — see typed commands,     │
 │                       │ passwords, flags, and interactive session content.     │
-│ vol3_hashdump         │ Dump NTLM password hashes from SAM registry hive.     │
 │ vol3_handles          │ Open handles per process (files, registry, mutexes).   │
 │ vol3_envars           │ Environment variables per process.                     │
 │ vol3_dumpfiles        │ Extract cached files from memory (by file object).     │
+│                       │ MUST USE ARGS: {"pid": 1234} or {"virtaddr": "0x12"}   │
 ├───────────────────────┼────────────────────────────────────────────────────────┤
 │ tsk_fls               │ Sleuth Kit: recursive file listing from disk image.    │
 │ tsk_mmls              │ Sleuth Kit: show partition layout of disk image.       │
@@ -103,14 +103,10 @@ Step 5 → vol3_filescan
 Step 6 → vol3_malfind
   Look for: RWX regions in suspect processes from earlier steps.
 
-Step 7 → vol3_hashdump
-  Dump NTLM hashes. The hash itself may be a flag or a password
-  needed to open an encrypted archive found earlier.
-
-Step 8 → vol3_handles
+Step 7 → vol3_handles
   Check what files/registry keys suspect processes had open.
 
-Step 9+ → vol3_dlllist, vol3_envars, vol3_dumpfiles as needed.
+Step 8+ → vol3_dlllist, vol3_envars, vol3_dumpfiles as needed.
 
 For disk images → tsk_mmls first, then tsk_fls.
 
@@ -125,8 +121,8 @@ CRITICAL RULES — NEVER BREAK THESE
 4. If a tool returns an error, note it and choose a different tool.
 5. Confidence: HIGH = 3+ evidence items, MEDIUM = 2, LOW = 1.
 6. Use ONLY numeric values (0.0-1.0) for confidence and threat_score.
-7. Do NOT say DONE until you have run vol3_consoles AND vol3_hashdump.
-   These often contain the critical evidence (flags, passwords, hashes).
+7. Do NOT say DONE until you have run vol3_consoles.
+   It often contains the critical evidence (flags, passwords).
 """
 
 # ── Available tools the LLM can pick from ──────────────────────────────
@@ -144,7 +140,6 @@ TOOL_CATALOG = {
     "vol3_dlllist":    {"name": "Volatility3 – DLL List",       "category": "memory_forensics", "plugin": "windows.dlllist"},
     "vol3_filescan":   {"name": "Volatility3 – File Scan",      "category": "memory_forensics", "plugin": "windows.filescan"},
     "vol3_consoles":   {"name": "Volatility3 – Consoles",       "category": "memory_forensics", "plugin": "windows.consoles"},
-    "vol3_hashdump":   {"name": "Volatility3 – Hash Dump",      "category": "memory_forensics", "plugin": "windows.hashdump"},
     "vol3_handles":    {"name": "Volatility3 – Handles",        "category": "memory_forensics", "plugin": "windows.handles"},
     "vol3_envars":     {"name": "Volatility3 – Env Vars",       "category": "memory_forensics", "plugin": "windows.envars"},
     "vol3_dumpfiles":  {"name": "Volatility3 – Dump Files",     "category": "memory_forensics", "plugin": "windows.dumpfiles"},
@@ -338,7 +333,7 @@ class RealForensicAgent:
         tools_called = len(self._tools_run)
 
         # Enforce mandatory tools before allowing DONE
-        mandatory_not_run = [t for t in ("vol3_consoles", "vol3_hashdump", "vol3_cmdline",
+        mandatory_not_run = [t for t in ("vol3_consoles", "vol3_cmdline",
                                           "vol3_filescan", "vol3_pslist")
                              if t not in self._tools_run and t in remaining]
 
@@ -348,14 +343,14 @@ class RealForensicAgent:
             f"CURRENT FINDINGS:\n{self.findings.to_text()}\n\n"
             "STOPPING CONDITIONS — only say DONE if ALL are true:\n"
             "  • vol3_consoles has been run (shows typed commands / flags / passwords)\n"
-            "  • vol3_hashdump has been run (NTLM hashes may BE the flag)\n"
             "  • vol3_filescan has been run (find hidden documents)\n"
             "  • Last 2 tools added zero new findings, OR all tools exhausted\n\n"
             f"MANDATORY TOOLS NOT YET RUN: {', '.join(mandatory_not_run) or 'all done'}\n\n"
             "Pick the NEXT tool. Prioritise mandatory tools first.\n"
             "Respond with ONLY a JSON object:\n"
             '{"reasoning": "<why this tool is needed based on findings>",'
-            ' "next_tool": "<tool_id or DONE>"}'
+            ' "next_tool": "<tool_id or DONE>",'
+            ' "args": {"pid": "1234"}}'
         )
         try:
             resp = await self.llm.chat.completions.create(
@@ -370,7 +365,8 @@ class RealForensicAgent:
             if "{" in text:
                 data = json.loads(text[text.find("{"):text.rfind("}") + 1])
                 choice = data.get("next_tool", "DONE")
-                logger.info(f"ReAct reasoning: {data.get('reasoning', '?')[:120]} → {choice}")
+                self._next_tool_args = data.get("args", {})
+                logger.info(f"ReAct reasoning: {data.get('reasoning', '?')[:120]} → {choice} with args {self._next_tool_args}")
 
                 # Override DONE if mandatory tools haven't run
                 if choice == "DONE" and mandatory_not_run:
@@ -482,7 +478,9 @@ class RealForensicAgent:
                 return await real_tools.tool_yara_scan(path)
             elif tool_id.startswith("vol3_"):
                 plugin = meta.get("plugin", "windows.pslist")
-                return await real_tools.tool_volatility3(path, plugin)
+                args = getattr(self, "_next_tool_args", {})
+                self._next_tool_args = {} # reset
+                return await real_tools.tool_volatility3(path, plugin, args)
             elif tool_id == "tsk_fls":
                 return await real_tools.tool_tsk_fls(path)
             elif tool_id == "tsk_mmls":
@@ -509,7 +507,7 @@ class RealForensicAgent:
             f"CURRENT FINDINGS SO FAR:\n{self.findings.to_text(2000)}\n\n"
             "Your task: analyse the raw output above like a senior forensic analyst.\n\n"
             "EXTRACTION RULES:\n"
-            "1. If the tool FAILED or returned empty output, say so. Do NOT invent evidence.\n"
+            "1. If the tool FAILED say so. If output is empty (e.g. just headers), it means NO evidence was found, NOT that the tool failed.\n"
             "2. Extract ONLY items that appear verbatim in the output above.\n"
             "3. For processes: note PID, name, parent PID, timestamps, and why suspicious.\n"
             "4. For network: note IP, port, protocol, associated process.\n"

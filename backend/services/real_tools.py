@@ -127,7 +127,7 @@ def _find_vol3() -> Optional[str]:
     return None
 
 
-async def tool_volatility3(artifact_path: str, plugin: str) -> Dict[str, Any]:
+async def tool_volatility3(artifact_path: str, plugin: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Run a volatility3 plugin on a memory dump."""
     vol3 = _find_vol3()
     if not vol3:
@@ -138,7 +138,19 @@ async def tool_volatility3(artifact_path: str, plugin: str) -> Dict[str, Any]:
             "error": "volatility3 not installed. Install with: pip install volatility3",
         }
 
+    # Dumpfiles MUST have a PID or virtaddr, otherwise it dumps thousands of files and crashes.
+    if plugin == "windows.dumpfiles" and not args:
+        return {
+            "tool": f"volatility3.{plugin}",
+            "output": "ERROR: dumpfiles requires an argument like --pid or --virtaddr to avoid extracting the entire filesystem.",
+            "success": False,
+        }
+
     cmd = [vol3, "-f", artifact_path, "-r", "csv", plugin]
+    if args:
+        for k, v in args.items():
+            if v:
+                cmd.extend([f"--{k}", str(v)])
 
     result = await run_cmd(cmd, timeout=600)
     return {
