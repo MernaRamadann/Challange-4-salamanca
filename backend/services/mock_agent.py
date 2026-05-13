@@ -5,13 +5,17 @@ Generates realistic forensic investigation steps with proper tool chain reasonin
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import uuid
 import random
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+import requests
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -235,6 +239,11 @@ class MockForensicAgent:
                 "description": "Query OTX for threat intelligence",
                 "command": "check_ioc_otx",
             },
+            "virustotal_hash_lookup": {
+                "name": "VirusTotal Hash Lookup",
+                "description": "Lookup hash reputation and scan results in VirusTotal",
+                "command": "virustotal_hash_lookup",
+            },
             "enrich_ioc": {
                 "name": "IOC Enrichment",
                 "description": "Unified IOC enrichment with threat scoring",
@@ -390,6 +399,7 @@ class MockForensicAgent:
                 {"category": "memory_forensics", "tool": "volatility_dlllist"},
                 {"category": "memory_forensics", "tool": "volatility_handles"},
                 {"category": "memory_forensics", "tool": "volatility_registry"},
+                {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
             ]
         if artifact_type == "disk_image":
             return [
@@ -398,6 +408,7 @@ class MockForensicAgent:
                 {"category": "malware_analysis", "tool": "strings"},
                 {"category": "disk_forensics", "tool": "sleuthkit_fls"},
                 {"category": "disk_forensics", "tool": "sleuthkit_icat"},
+                {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
             ]
         if artifact_type == "evtx":
             return [
@@ -406,6 +417,7 @@ class MockForensicAgent:
                 {"category": "windows_forensics", "tool": "evtxecmd"},
                 {"category": "windows_forensics", "tool": "pecmd"},
                 {"category": "windows_forensics", "tool": "recmd"},
+                {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
             ]
         if artifact_type == "malware_sample":
             return [
@@ -415,14 +427,17 @@ class MockForensicAgent:
                 {"category": "malware_analysis", "tool": "floss"},
                 {"category": "binary_analysis", "tool": "disassemble"},
                 {"category": "malware_analysis", "tool": "yara_ai"},
+                {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
             ]
         if artifact_type == "pcap":
             return [
                 {"category": "network_forensics", "tool": "pcap_analysis"},
+                {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
             ]
         return [
             {"category": "malware_analysis", "tool": "strings"},
             {"category": "malware_analysis", "tool": "yara"},
+            {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
         ]
 
     async def _plan_next_tool(
@@ -545,34 +560,40 @@ class MockForensicAgent:
                     {"category": "memory_forensics", "tool": "volatility_pstree"},
                     {"category": "memory_forensics", "tool": "volatility_netscan"},
                     {"category": "malware_analysis", "tool": "strings"},
+                    {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
                 ]
             elif artifact_type == "disk_image":
                 tools = [
                     {"category": "disk_forensics", "tool": "plaso_log2timeline"},
                     {"category": "windows_forensics", "tool": "hayabusa"},
                     {"category": "malware_analysis", "tool": "strings"},
+                    {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
                 ]
             elif artifact_type == "evtx":
                 tools = [
                     {"category": "windows_forensics", "tool": "chainsaw"},
                     {"category": "windows_forensics", "tool": "hayabusa"},
                     {"category": "windows_forensics", "tool": "evtxecmd"},
+                    {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
                 ]
             elif artifact_type == "malware_sample":
                 tools = [
                     {"category": "malware_analysis", "tool": "pe_analysis"},
                     {"category": "malware_analysis", "tool": "strings"},
                     {"category": "malware_analysis", "tool": "yara"},
+                    {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
                 ]
             elif artifact_type == "pcap":
                 tools = [
                     {"category": "network_forensics", "tool": "pcap_analysis"},
                     {"category": "network_forensics", "tool": "zeek"},
+                    {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
                 ]
             else:
                 tools = [
                     {"category": "malware_analysis", "tool": "strings"},
                     {"category": "malware_analysis", "tool": "yara"},
+                    {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
                 ]
 
         elif phase == "deep_analysis":
@@ -599,6 +620,7 @@ class MockForensicAgent:
             tools = [
                 {"category": "threat_intelligence", "tool": "ioc_local"},
                 {"category": "threat_intelligence", "tool": "ioc_otx"},
+                {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
                 {"category": "threat_intelligence", "tool": "enrich_ioc"},
             ]
 
@@ -702,6 +724,9 @@ class MockForensicAgent:
         previous_evidence: List[Dict],
     ) -> Dict[str, Any]:
         """Generate realistic tool output based on tool type."""
+        if category == "threat_intelligence" and tool_id == "virustotal_hash_lookup":
+            return await self._generate_virustotal_output(previous_evidence)
+
         if os.getenv("REAL_FORENSIC_ANALYSIS", "true").lower() in ("1", "true", "yes", "y"):
             tool_output = await self._generate_tool_output_llm(category, tool_id, previous_evidence)
             if tool_output:
@@ -769,6 +794,167 @@ class MockForensicAgent:
         except Exception as exc:
             logger.exception("OpenAI tool output generation failed")
             return {}
+
+    async def _generate_virustotal_output(self, previous_evidence: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Query VirusTotal for hash reputation when an API key is configured."""
+        api_key = os.getenv("VIRUSTOTAL_API_KEY", "").strip()
+        hash_values = self._extract_hash_iocs(previous_evidence)
+        if not hash_values:
+            artifact_hash = await self._compute_artifact_sha256()
+            if artifact_hash:
+                hash_values = [artifact_hash]
+
+        if not hash_values:
+            return {
+                "thought": "Attempting VirusTotal lookup, but no file hash is available.",
+                "action": "Extract a hash from previous evidence or compute the artifact hash for VirusTotal lookup.",
+                "input": {"source": "previous_evidence_or_artifact"},
+                "output": {
+                    "raw": "No hash IOC or artifact hash was found. Add a hash to evidence or upload a sample file.",
+                },
+                "evidence": [],
+                "mitre_techniques": [],
+                "timeline_events": [],
+                "next_step_reasoning": "Collect a file hash before performing VirusTotal reputation checks.",
+            }
+
+        hash_value = hash_values[0]
+        if not api_key:
+            return {
+                "thought": "VirusTotal API key is not configured.",
+                "action": "Set VIRUSTOTAL_API_KEY in the environment to enable VirusTotal hash reputation lookups.",
+                "input": {"hash": hash_value},
+                "output": {
+                    "raw": "VIRUSTOTAL_API_KEY is missing. The tool cannot query VirusTotal without an API key.",
+                },
+                "evidence": [
+                    {
+                        "type": "threat_intel",
+                        "value": f"VirusTotal lookup skipped for {hash_value} because API key is not configured.",
+                        "confidence": 0.2,
+                        "context": "VirusTotal API key missing",
+                        "mitre_techniques": [],
+                        "threat_score": 0.2,
+                    }
+                ],
+                "mitre_techniques": [],
+                "timeline_events": [],
+                "next_step_reasoning": "Configure VIRUSTOTAL_API_KEY to enrich investigations with external reputation data.",
+            }
+
+        try:
+            vt_data = await asyncio.to_thread(self._query_virustotal, hash_value, api_key)
+            if not vt_data or vt_data.get("status_code") != 200:
+                return {
+                    "thought": "VirusTotal lookup failed or the hash was not found.",
+                    "action": "Inspect the VirusTotal response and ensure the API key and hash are valid.",
+                    "input": {"hash": hash_value},
+                    "output": {
+                        "raw": vt_data.get("message", "VirusTotal lookup failed."),
+                    },
+                    "evidence": [],
+                    "mitre_techniques": [],
+                    "timeline_events": [],
+                    "next_step_reasoning": "Verify the hash and API key, then retry the lookup.",
+                }
+
+            attributes = vt_data["data"]["attributes"]
+            analysis_stats = attributes.get("last_analysis_stats", {})
+            malicious = analysis_stats.get("malicious", 0)
+            suspicious = analysis_stats.get("suspicious", 0)
+            harmless = analysis_stats.get("harmless", 0)
+            undetected = analysis_stats.get("undetected", 0)
+            total = sum([malicious, suspicious, harmless, undetected]) if analysis_stats else None
+            score = min(1.0, (malicious + suspicious * 0.5) / max(total or 1, 1))
+            raw = [f"{k}: {v}" for k, v in analysis_stats.items()]
+            raw_text = "\n".join(raw)
+            vt_link = f"https://www.virustotal.com/gui/file/{hash_value}/detection"
+
+            return {
+                "thought": "VirusTotal scan results provide a high-confidence view of the file hash reputation.",
+                "action": "Query VirusTotal and summarize scan statistics for the artifact hash.",
+                "input": {"hash": hash_value, "source": "VirusTotal API"},
+                "output": {
+                    "raw": raw_text,
+                    "parsed": {
+                        "hash": hash_value,
+                        "malicious": malicious,
+                        "suspicious": suspicious,
+                        "harmless": harmless,
+                        "undetected": undetected,
+                        "total_engines": total,
+                        "vt_url": vt_link,
+                    },
+                },
+                "evidence": [
+                    {
+                        "type": "threat_intel",
+                        "value": f"VirusTotal: {malicious} malicious, {suspicious} suspicious detections for {hash_value}.",
+                        "confidence": 0.95,
+                        "context": "VirusTotal reputation lookup",
+                        "mitre_techniques": [],
+                        "threat_score": score,
+                    },
+                    {
+                        "type": "hash",
+                        "value": hash_value,
+                        "confidence": 0.9,
+                        "context": "File hash used for VirusTotal reputation lookup",
+                        "mitre_techniques": [],
+                        "threat_score": 0.8,
+                    },
+                ],
+                "mitre_techniques": [],
+                "timeline_events": [],
+                "next_step_reasoning": "Use the VirusTotal verdict to prioritize deeper malware and threat intelligence analysis.",
+            }
+        except Exception as exc:
+            logger.exception("VirusTotal lookup failed")
+            return {
+                "thought": "VirusTotal lookup failed due to an internal error.",
+                "action": "Review the VirusTotal API request and retry when the service is available.",
+                "input": {"hash": hash_value},
+                "output": {
+                    "raw": str(exc),
+                },
+                "evidence": [],
+                "mitre_techniques": [],
+                "timeline_events": [],
+                "next_step_reasoning": "Retry the lookup after fixing any network or API configuration issues.",
+            }
+
+    def _extract_hash_iocs(self, previous_evidence: List[Dict[str, Any]]) -> List[str]:
+        hashes: List[str] = []
+        for ev in previous_evidence:
+            if ev.get("type") == "hash" and isinstance(ev.get("value"), str):
+                value = ev["value"].strip()
+                if re.fullmatch(r"[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64}", value):
+                    hashes.append(value.lower())
+        return hashes
+
+    async def _compute_artifact_sha256(self) -> Optional[str]:
+        session_obj = self.session_manager.get_session_object(self.session_id)
+        if not session_obj:
+            return None
+        artifact_path = getattr(session_obj, "artifact_path", None)
+        if not artifact_path or not os.path.isfile(artifact_path):
+            return None
+        return await asyncio.to_thread(self._hash_file, artifact_path)
+
+    def _hash_file(self, path: str) -> str:
+        hasher = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(8192), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def _query_virustotal(self, hash_value: str, api_key: str) -> Dict[str, Any]:
+        headers = {"x-apikey": api_key}
+        url = f"https://www.virustotal.com/api/v3/files/{hash_value}"
+        response = requests.get(url, headers=headers, timeout=20)
+        if response.status_code != 200:
+            return {"status_code": response.status_code, "message": response.text}
+        return response.json()
 
     async def _call_openai(self, prompt: str) -> str:
         """Call the configured OpenAI-compatible model and return the raw text."""

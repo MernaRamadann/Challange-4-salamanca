@@ -69,6 +69,7 @@ You have access to the following tools. Call them one at a time:
 ├───────────────────────┼────────────────────────────────────────────────────────┤
 │ tsk_fls               │ Sleuth Kit: recursive file listing from disk image.    │
 │ tsk_mmls              │ Sleuth Kit: show partition layout of disk image.       │
+│ virustotal_hash_lookup│ Query VirusTotal for hash reputation (malicious count).│
 └───────────────────────┴────────────────────────────────────────────────────────┘
 
 ═══════════════════════════
@@ -76,7 +77,7 @@ DECISION STRATEGY (follow this order for a memory dump)
 ═══════════════════════════
 
 Phase 1 — Triage (automatic, already done before you are asked):
-  file_identify → strings_extract → hexdump → yara_scan
+  file_identify → strings_extract → hexdump → yara_scan → virustotal_hash_lookup (on artifact)
 
 Phase 2 — Deep Analysis (YOU decide the order):
 
@@ -146,6 +147,7 @@ TOOL_CATALOG = {
     # ── Sleuth Kit ──
     "tsk_fls":         {"name": "Sleuth Kit – File Listing",    "category": "disk_forensics"},
     "tsk_mmls":        {"name": "Sleuth Kit – Partition Map",   "category": "disk_forensics"},
+    "virustotal_hash_lookup": {"name": "VirusTotal Hash Lookup", "category": "threat_intelligence"},
 }
 
 TOOL_LIST_TEXT = "\n".join(f"  • {tid}" for tid in TOOL_CATALOG)
@@ -290,7 +292,7 @@ class RealForensicAgent:
 
         try:
             # ── Phase 1: triage (always) ───────────────────────────
-            for tid in ("file_identify", "strings_extract", "hexdump", "yara_scan"):
+            for tid in ("file_identify", "strings_extract", "hexdump", "yara_scan", "virustotal_hash_lookup"):
                 if self._stopped:
                     break
                 while self._paused:
@@ -485,6 +487,10 @@ class RealForensicAgent:
                 return await real_tools.tool_tsk_fls(path)
             elif tool_id == "tsk_mmls":
                 return await real_tools.tool_tsk_mmls(path)
+            elif tool_id == "virustotal_hash_lookup":
+                args = getattr(self, "_next_tool_args", {})
+                self._next_tool_args = {}
+                return await real_tools.tool_virustotal_hash_lookup(path, args.get("hash"))
             return {"tool": tool_id, "output": "Unknown tool", "success": False}
         except Exception as e:
             logger.exception(f"Tool {tool_id} failed")

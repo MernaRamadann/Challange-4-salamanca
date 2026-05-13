@@ -339,6 +339,107 @@ async def tool_tsk_mmls(artifact_path: str) -> Dict[str, Any]:
 
 
 # ============================================================================
+# Tool: VirusTotal (threat intelligence)
+# ============================================================================
+
+def _hash_file(path: str) -> str:
+    """Compute SHA256 hash of a file."""
+    import hashlib
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8192), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+async def tool_virustotal_hash_lookup(artifact_path: str, hash_value: Optional[str] = None) -> Dict[str, Any]:
+    """Lookup hash reputation in VirusTotal."""
+    import requests
+    api_key = os.getenv("VIRUSTOTAL_API_KEY", "").strip()
+    
+    # If no hash provided, compute hash of the artifact itself
+    if not hash_value:
+        try:
+            hash_value = await asyncio.to_thread(_hash_file, artifact_path)
+        except Exception as e:
+            return {
+                "tool": "virustotal",
+                "output": f"Error computing artifact hash: {e}",
+                "success": False
+            }
+
+    if not api_key:
+        return {
+            "tool": "virustotal",
+            "output": f"VIRUSTOTAL_API_KEY not configured. Hash: {hash_value}",
+            "success": False,
+            "hash": hash_value,
+            "note": "Set VIRUSTOTAL_API_KEY in .env to enable this tool."
+        }
+
+    try:
+        url = f"https://www.virustotal.com/api/v3/files/{hash_value}"
+        headers = {"x-apikey": api_key}
+        
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=20)
+        
+        if response.status_code == 404:
+            return {
+                "tool": "virustotal",
+                "output": f"Hash not found in VirusTotal: {hash_value}",
+                "success": True,
+                "found": False,
+                "hash": hash_value
+            }
+            
+        if response.status_code != 200:
+            return {
+                "tool": "virustotal",
+                "output": f"VirusTotal API error ({response.status_code}): {response.text}",
+                "success": False,
+                "hash": hash_value
+            }
+
+        data = response.json()
+        # Simplify output for LLM context
+        attr = data.get("data", {}).get("attributes", {})
+        stats = attr.get("last_analysis_stats", {})
+        results = attr.get("last_analysis_results", {})
+        
+        # Extract meaningful detections
+        detections = []
+        for engine, res in results.items():
+            if res.get("category") == "malicious":
+                detections.append(f"{engine}: {res.get('result')}")
+
+        summary = (
+            f"VirusTotal Results for {hash_value}:\n"
+            f"  Malicious: {stats.get('malicious', 0)}\n"
+            f"  Suspicious: {stats.get('suspicious', 0)}\n"
+            f"  Harmless: {stats.get('harmless', 0)}\n"
+            f"  Undetected: {stats.get('undetected', 0)}\n\n"
+            f"Detections (sample):\n" + "\n".join(detections[:10])
+        )
+        
+        return {
+            "tool": "virustotal",
+            "description": "VirusTotal hash reputation lookup",
+            "output": summary,
+            "success": True,
+            "data": data,
+            "hash": hash_value,
+            "malicious_count": stats.get('malicious', 0)
+        }
+    except Exception as e:
+        return {
+            "tool": "virustotal",
+            "output": f"VirusTotal lookup failed: {e}",
+            "success": False,
+            "hash": hash_value
+        }
+
+
+# ============================================================================
 # Master: get available tools
 # ============================================================================
 
