@@ -363,14 +363,14 @@ async def tool_virustotal_hash_lookup(artifact_path: str, hash_value: Optional[s
             hash_value = await asyncio.to_thread(_hash_file, artifact_path)
         except Exception as e:
             return {
-                "tool": "virustotal",
+                "tool": "virustotal_hash",
                 "output": f"Error computing artifact hash: {e}",
                 "success": False
             }
 
     if not api_key:
         return {
-            "tool": "virustotal",
+            "tool": "virustotal_hash",
             "output": f"VIRUSTOTAL_API_KEY not configured. Hash: {hash_value}",
             "success": False,
             "hash": hash_value,
@@ -385,7 +385,7 @@ async def tool_virustotal_hash_lookup(artifact_path: str, hash_value: Optional[s
         
         if response.status_code == 404:
             return {
-                "tool": "virustotal",
+                "tool": "virustotal_hash",
                 "output": f"Hash not found in VirusTotal: {hash_value}",
                 "success": True,
                 "found": False,
@@ -394,26 +394,24 @@ async def tool_virustotal_hash_lookup(artifact_path: str, hash_value: Optional[s
             
         if response.status_code != 200:
             return {
-                "tool": "virustotal",
+                "tool": "virustotal_hash",
                 "output": f"VirusTotal API error ({response.status_code}): {response.text}",
                 "success": False,
                 "hash": hash_value
             }
 
         data = response.json()
-        # Simplify output for LLM context
         attr = data.get("data", {}).get("attributes", {})
         stats = attr.get("last_analysis_stats", {})
         results = attr.get("last_analysis_results", {})
         
-        # Extract meaningful detections
         detections = []
         for engine, res in results.items():
             if res.get("category") == "malicious":
                 detections.append(f"{engine}: {res.get('result')}")
 
         summary = (
-            f"VirusTotal Results for {hash_value}:\n"
+            f"VirusTotal Hash Results for {hash_value}:\n"
             f"  Malicious: {stats.get('malicious', 0)}\n"
             f"  Suspicious: {stats.get('suspicious', 0)}\n"
             f"  Harmless: {stats.get('harmless', 0)}\n"
@@ -422,7 +420,7 @@ async def tool_virustotal_hash_lookup(artifact_path: str, hash_value: Optional[s
         )
         
         return {
-            "tool": "virustotal",
+            "tool": "virustotal_hash",
             "description": "VirusTotal hash reputation lookup",
             "output": summary,
             "success": True,
@@ -432,11 +430,74 @@ async def tool_virustotal_hash_lookup(artifact_path: str, hash_value: Optional[s
         }
     except Exception as e:
         return {
-            "tool": "virustotal",
+            "tool": "virustotal_hash",
             "output": f"VirusTotal lookup failed: {e}",
             "success": False,
             "hash": hash_value
         }
+
+
+async def tool_virustotal_ip_lookup(ip_address: str) -> Dict[str, Any]:
+    """Lookup IP reputation in VirusTotal."""
+    import requests
+    api_key = os.getenv("VIRUSTOTAL_API_KEY", "").strip()
+    
+    if not api_key:
+        return {"tool": "virustotal_ip", "output": "VIRUSTOTAL_API_KEY not configured.", "success": False}
+
+    try:
+        url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip_address}"
+        headers = {"x-apikey": api_key}
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=20)
+        
+        if response.status_code != 200:
+            return {"tool": "virustotal_ip", "output": f"Error: {response.status_code}", "success": False}
+
+        data = response.json()
+        attr = data.get("data", {}).get("attributes", {})
+        stats = attr.get("last_analysis_stats", {})
+        
+        summary = (
+            f"VirusTotal IP Results for {ip_address}:\n"
+            f"  Malicious: {stats.get('malicious', 0)}\n"
+            f"  Suspicious: {stats.get('suspicious', 0)}\n"
+            f"  Owner: {attr.get('as_owner', 'Unknown')}\n"
+            f"  Country: {attr.get('country', 'Unknown')}"
+        )
+        return {"tool": "virustotal_ip", "output": summary, "success": True, "data": data}
+    except Exception as e:
+        return {"tool": "virustotal_ip", "output": str(e), "success": False}
+
+
+async def tool_virustotal_domain_lookup(domain: str) -> Dict[str, Any]:
+    """Lookup domain reputation in VirusTotal."""
+    import requests
+    api_key = os.getenv("VIRUSTOTAL_API_KEY", "").strip()
+    
+    if not api_key:
+        return {"tool": "virustotal_domain", "output": "VIRUSTOTAL_API_KEY not configured.", "success": False}
+
+    try:
+        url = f"https://www.virustotal.com/api/v3/domains/{domain}"
+        headers = {"x-apikey": api_key}
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=20)
+        
+        if response.status_code != 200:
+            return {"tool": "virustotal_domain", "output": f"Error: {response.status_code}", "success": False}
+
+        data = response.json()
+        attr = data.get("data", {}).get("attributes", {})
+        stats = attr.get("last_analysis_stats", {})
+        
+        summary = (
+            f"VirusTotal Domain Results for {domain}:\n"
+            f"  Malicious: {stats.get('malicious', 0)}\n"
+            f"  Suspicious: {stats.get('suspicious', 0)}\n"
+            f"  Creation Date: {datetime.fromtimestamp(attr.get('creation_date', 0)).isoformat() if attr.get('creation_date') else 'Unknown'}"
+        )
+        return {"tool": "virustotal_domain", "output": summary, "success": True, "data": data}
+    except Exception as e:
+        return {"tool": "virustotal_domain", "output": str(e), "success": False}
 
 
 # ============================================================================

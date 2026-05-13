@@ -244,6 +244,16 @@ class MockForensicAgent:
                 "description": "Lookup hash reputation and scan results in VirusTotal",
                 "command": "virustotal_hash_lookup",
             },
+            "virustotal_ip_lookup": {
+                "name": "VirusTotal IP Lookup",
+                "description": "Lookup IP reputation and geolocation in VirusTotal",
+                "command": "virustotal_ip_lookup",
+            },
+            "virustotal_domain_lookup": {
+                "name": "VirusTotal Domain Lookup",
+                "description": "Lookup domain reputation and creation history in VirusTotal",
+                "command": "virustotal_domain_lookup",
+            },
             "enrich_ioc": {
                 "name": "IOC Enrichment",
                 "description": "Unified IOC enrichment with threat scoring",
@@ -621,6 +631,8 @@ class MockForensicAgent:
                 {"category": "threat_intelligence", "tool": "ioc_local"},
                 {"category": "threat_intelligence", "tool": "ioc_otx"},
                 {"category": "threat_intelligence", "tool": "virustotal_hash_lookup"},
+                {"category": "threat_intelligence", "tool": "virustotal_ip_lookup"},
+                {"category": "threat_intelligence", "tool": "virustotal_domain_lookup"},
                 {"category": "threat_intelligence", "tool": "enrich_ioc"},
             ]
 
@@ -717,15 +729,20 @@ class MockForensicAgent:
 
         return step
 
-    async def _generate_tool_output(
+    async def _generate_realistic_output(
         self,
         category: str,
         tool_id: str,
         previous_evidence: List[Dict],
     ) -> Dict[str, Any]:
         """Generate realistic tool output based on tool type."""
-        if category == "threat_intelligence" and tool_id == "virustotal_hash_lookup":
-            return await self._generate_virustotal_output(previous_evidence)
+        if category == "threat_intelligence":
+            if tool_id == "virustotal_hash_lookup":
+                return await self._generate_virustotal_output(previous_evidence)
+            elif tool_id == "virustotal_ip_lookup":
+                return await self._generate_virustotal_ip_output(previous_evidence)
+            elif tool_id == "virustotal_domain_lookup":
+                return await self._generate_virustotal_domain_output(previous_evidence)
 
         if os.getenv("REAL_FORENSIC_ANALYSIS", "true").lower() in ("1", "true", "yes", "y"):
             tool_output = await self._generate_tool_output_llm(category, tool_id, previous_evidence)
@@ -922,6 +939,34 @@ class MockForensicAgent:
                 "timeline_events": [],
                 "next_step_reasoning": "Retry the lookup after fixing any network or API configuration issues.",
             }
+
+    async def _generate_virustotal_ip_output(self, previous_evidence: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Mock output for VirusTotal IP lookup."""
+        ip = next((ev["value"] for ev in previous_evidence if ev.get("type") == "ip"), "185.220.101.45")
+        return {
+            "thought": f"Querying VirusTotal for reputation of IP {ip}.",
+            "action": f"VirusTotal IP lookup: {ip}",
+            "input": {"ip": ip},
+            "output": {"raw": f"IP: {ip}\nMalicious: 12\nSuspicious: 2\nOwner: M247 Europe SRL\nCountry: RO"},
+            "evidence": [{"type": "ip", "value": ip, "confidence": 0.9, "context": "VT Malicious IP", "threat_score": 0.85}],
+            "mitre_techniques": [],
+            "timeline_events": [],
+            "next_step_reasoning": "IP is confirmed malicious. Investigating associated processes.",
+        }
+
+    async def _generate_virustotal_domain_output(self, previous_evidence: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Mock output for VirusTotal Domain lookup."""
+        domain = next((ev["value"] for ev in previous_evidence if ev.get("type") == "domain"), "evil-domain.com")
+        return {
+            "thought": f"Querying VirusTotal for reputation of domain {domain}.",
+            "action": f"VirusTotal domain lookup: {domain}",
+            "input": {"domain": domain},
+            "output": {"raw": f"Domain: {domain}\nMalicious: 8\nSuspicious: 1\nCreation Date: 2024-01-10"},
+            "evidence": [{"type": "domain", "value": domain, "confidence": 0.85, "context": "VT Malicious Domain", "threat_score": 0.8}],
+            "mitre_techniques": [],
+            "timeline_events": [],
+            "next_step_reasoning": "Domain is suspicious. Checking for network connections to this host.",
+        }
 
     def _extract_hash_iocs(self, previous_evidence: List[Dict[str, Any]]) -> List[str]:
         hashes: List[str] = []

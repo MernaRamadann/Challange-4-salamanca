@@ -70,6 +70,8 @@ You have access to the following tools. Call them one at a time:
 │ tsk_fls               │ Sleuth Kit: recursive file listing from disk image.    │
 │ tsk_mmls              │ Sleuth Kit: show partition layout of disk image.       │
 │ virustotal_hash_lookup│ Query VirusTotal for hash reputation (malicious count).│
+│ virustotal_ip_lookup  │ Query VirusTotal for IP reputation and geolocation.    │
+│ virustotal_domain_lookup│ Query VirusTotal for Domain reputation and creation. │
 └───────────────────────┴────────────────────────────────────────────────────────┘
 
 ═══════════════════════════
@@ -95,11 +97,12 @@ Step 3 → vol3_consoles
 
 Step 4 → vol3_netscan
   Look for: outbound connections on unusual ports from non-browser
-  processes. Note remote IPs.
+  processes. Note remote IPs. Check suspect IPs with virustotal_ip_lookup.
 
 Step 5 → vol3_filescan
   Look for: .rar, .zip, .txt, .flag, .key files. Find documents
-  the user had open. Cross-reference with process list.
+  the user had open. Cross-reference with process list. Check hashes
+  of interesting extracted files with virustotal_hash_lookup.
 
 Step 6 → vol3_malfind
   Look for: RWX regions in suspect processes from earlier steps.
@@ -148,6 +151,8 @@ TOOL_CATALOG = {
     "tsk_fls":         {"name": "Sleuth Kit – File Listing",    "category": "disk_forensics"},
     "tsk_mmls":        {"name": "Sleuth Kit – Partition Map",   "category": "disk_forensics"},
     "virustotal_hash_lookup": {"name": "VirusTotal Hash Lookup", "category": "threat_intelligence"},
+    "virustotal_ip_lookup":   {"name": "VirusTotal IP Lookup",   "category": "threat_intelligence"},
+    "virustotal_domain_lookup": {"name": "VirusTotal Domain Lookup", "category": "threat_intelligence"},
 }
 
 TOOL_LIST_TEXT = "\n".join(f"  • {tid}" for tid in TOOL_CATALOG)
@@ -491,6 +496,14 @@ class RealForensicAgent:
                 args = getattr(self, "_next_tool_args", {})
                 self._next_tool_args = {}
                 return await real_tools.tool_virustotal_hash_lookup(path, args.get("hash"))
+            elif tool_id == "virustotal_ip_lookup":
+                args = getattr(self, "_next_tool_args", {})
+                self._next_tool_args = {}
+                return await real_tools.tool_virustotal_ip_lookup(args.get("ip"))
+            elif tool_id == "virustotal_domain_lookup":
+                args = getattr(self, "_next_tool_args", {})
+                self._next_tool_args = {}
+                return await real_tools.tool_virustotal_domain_lookup(args.get("domain"))
             return {"tool": tool_id, "output": "Unknown tool", "success": False}
         except Exception as e:
             logger.exception(f"Tool {tool_id} failed")
